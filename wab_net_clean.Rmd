@@ -1,0 +1,1741 @@
+---
+title: "wab_net_prevalence"
+author: "John Neddermeyer"
+date: "7/26/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(lme4)
+library(lubridate)
+library(vegan)
+library(foreach)
+library(doParallel)
+```
+
+```{r}
+#Function to center and scale continuous variables
+center_scale = function(x) { (x - mean(x)) / (2 * sd(x)) }
+```
+
+##Reading in and formating data
+
+```{r}
+#reading in sample data from local directory
+prevalence_data<-
+  read.csv("~/Desktop/ecohealth_work/research_project/WABNet_Bat_CoV_data.csv")
+#reading in site characterization data from local directory
+site_data<-
+  read.csv("~/Desktop/ecohealth_work/research_project/WABNet_Site_Data.csv")
+#filter sample data to only include samples that have been tested
+#change CoV_Results to a factor class with 0 being negative test result
+#1 being positive test.
+#Combined the columns "male reproductive status" and 
+#"female reproductive status" into 1 column "male_female_reproductive_status"
+screened_samples<-prevalence_data %>% filter(CoV_Results!="") %>%
+  mutate(CoV_Results=factor(if_else(CoV_Results=="Negative", 0, 1)),
+         male_female_reproductive_status=
+           paste(Reproductive.status..Male,Reproductive.status..Female))
+#extract site characteristic variables for testing
+#rename the "Site.name" column to match "Site" column in sample data
+#Create column for laboratory source, as more data become available make sure
+#these lab country combinations still line up
+site_variables<-site_data %>% select(Country,Site.name,
+                        Human.population.size.in.1.km.radius.of.site.,
+                    Trapping.at.a.cave.or.mine.,
+                    Site.accessibility,
+                    Frequency.of.human.visitation.to.the.site,
+                    Specify.other.frequency.of.human.visitation,
+                    Water.present.at.the.site.,
+                    Date.of.site.characterization) %>% 
+  rename(Site=Site.name) %>% 
+  mutate(lab=if_else(Country=="Azerbaijan (AZ)" | 
+                       Country=="Turkey (TR)" | 
+                       Country=="Georgia (GE)" |
+                       Country=="Pakistan (PK)","Lab_A", "Lab_B"))
+#Reformatting screened samples data frame to remove individual columns for
+#each bat family and to take the species contained within each bat family
+#column and placing them in a "Species" column. Also, removing individual
+#reproductive status columns for male and female. This information has already
+#been combined into a single column "male_female_reproductive_status"
+gathered_results<-screened_samples%>%
+  pivot_longer(col = starts_with("Family"), 
+               names_to = "Fam", values_to="Species") %>% 
+  filter(Species != "") %>% 
+  select(-Fam,-starts_with("Reproductive.status"))
+#Merging site_variables data frame with gathered results so all variables
+#are contained in a single data frame.
+gathered_results<-left_join(gathered_results,site_variables,by="Site")
+#remove trailing white spaces from factors in columns
+#extracting the names of columns where the data type is character. That's what
+#"is.character" is doing. If the logical is "TRUE" the column name is stored
+#in the object "cols_to_be_rectified"
+cols_to_be_rectified <- 
+  names(gathered_results)[vapply(gathered_results, is.character, logical(1))]
+#columns_to_be_rectified are targeted to remove trailing white spaces from 
+#levels of variable. This is passed to lapply where the function "trimws"
+#is used
+gathered_results[,cols_to_be_rectified] <- 
+  lapply(gathered_results[,cols_to_be_rectified], trimws,c("both"))
+#This loop is going through the columns in gathered_results and if the column
+#is stored as a character it removes the white space and replaces it with "_"
+for(i in 1:ncol(gathered_results)){
+  if(is.character(pull(gathered_results[,i]))=="FALSE"){
+    gathered_results[,i]<-pull(gathered_results[,i])
+  }else{
+    gathered_results[,i]<-gsub(" ","_",pull(gathered_results[,i]))
+  }
+}
+#Using lubridate package functions converting "Date.of.site.characterization"
+#to "day_of_the_year" where day 1 is January 1st of the sampling year. Adding
+#column for genus and shortening "Site.accessibility" levels.
+#recode "Specify.other.frequency.of.human.visitation" category into frequency 
+#of visitation first I combined the frequency column with the specify other 
+#column by replacing "other" with the description of the site then I 
+#reclassified the "other" description
+#remember to hold off on converting character class to factor class until
+#the end. Manipulating the factor class makes this more challenging.
+gathered_results <- gathered_results %>% 
+  mutate(date=dmy(Date.of.site.characterization),
+         day_of_year=yday(date),sample_year=factor(year(date)),
+         Site.accessibility=
+           word(gathered_results$Site.accessibility,1,sep = "_"),
+         genus=
+           word(gathered_results$Species,1,sep = "_"),
+         Frequency.of.human.visitation.to.the.site=
+           if_else(
+             Specify.other.frequency.of.human.visitation=="",
+             Frequency.of.human.visitation.to.the.site,
+             Specify.other.frequency.of.human.visitation), 
+         Frequency.of.human.visitation.to.the.site=
+           recode(Frequency.of.human.visitation.to.the.site,
+                  "Depend_on_visitors"="Occasionally",
+                  "Once_in_3-4_month"="Seasonal",
+                  "Spring_and_summer_seasons_only"="Seasonal")) %>% 
+  select(-Specify.other.frequency.of.human.visitation) %>%
+  mutate_if(is.character, as.factor)
+```
+
+```{r}
+#Building a data frame with the number of each species captured at each site
+#Needed to calculate species diversity metrics
+diversity_matrix<-gathered_results %>% group_by(Site, Species) %>% 
+  summarise(Samples = n()) %>% 
+  pivot_wider(names_from = Species, 
+              values_from = Samples, values_fill = c(Samples=0))
+d<-data.frame(diversity_matrix,row.names = TRUE)
+#Calculate different diversity metrics using vegan package. Simpson, Shannon,
+#and rarefied species diversity
+diversity_matrix<-cbind(diversity_matrix,
+                        data.frame(Shannon_H_index=
+                                     vegan::diversity(d,"shannon"),
+                                   simp=vegan::diversity(d,"simpson"),
+                                   rare=
+                                     vegan::rarefy(d,min(rowSums(d))),
+                                   spec_num=vegan::specnumber(d)))
+gathered_results<-left_join(gathered_results,diversity_matrix %>% 
+                        select(Shannon_H_index,simp,rare,spec_num),
+                        by="Site")
+#generate fraction female at each site
+fraction_female<-gathered_results %>% group_by(Site,Sex) %>% 
+  summarise(S=n())%>% 
+  pivot_wider(names_from = Sex, 
+              values_from = S, values_fill = c(Samples=0))
+fraction_female$Total<-apply(fraction_female[,2:3],1,sum)
+fraction_female<-fraction_female %>% 
+  mutate(Fraction_F=`Female_(F)`/`Total`)
+#generate fraction juvenile at each site
+fraction_juvenile<-gathered_results %>% group_by(Site,Age) %>% 
+  summarise(S=n())%>% 
+  pivot_wider(names_from = Age, 
+              values_from = S, values_fill = c(Samples=0))
+fraction_juvenile$Total<-apply(fraction_juvenile[,2:3],1,sum)
+fraction_juvenile<-fraction_juvenile %>% 
+  mutate(Fraction_juv=`Juvenile_(J)`/`Total`)
+#add fraction juvenile and female to data, center and scale each of these
+#variables
+gathered_results<-left_join(left_join(gathered_results,
+                                      fraction_juvenile %>% 
+                              select(Fraction_juv),by="Site"),
+                            fraction_female %>% select(Fraction_F),
+                            by="Site") %>%
+  mutate(Shannon_H_index_cs=center_scale(Shannon_H_index),
+         Fraction_juv_cs=center_scale(Fraction_juv),
+         Fraction_F_cs=center_scale(Fraction_F))
+```
+
+##Some sample size summary tables
+
+```{r}
+gathered_results %>% group_by(Bat.family) %>% summarise(samples=n())
+gathered_results %>% group_by(genus) %>% summarise(samples=n())
+gathered_results %>% group_by(Country) %>% summarise(samples=n())
+gathered_results %>% group_by(Site) %>% summarise(samples=n())
+table(gathered_results$genus,gathered_results$Age)
+table(gathered_results$Bat.family,gathered_results$Age)
+gathered_results %>% 
+  group_by(Country, Human.population.size.in.1.km.radius.of.site.) %>% 
+  summarise(samples=n())
+gathered_results %>% 
+  group_by(Country, Frequency.of.human.visitation.to.the.site) %>% 
+  summarise(samples=n())
+gathered_results %>% 
+  group_by(Country, Site.accessibility) %>% 
+  summarise(samples=n())
+
+```
+
+##Building exploratory figures
+
+```{r}
+#Where I got a chunk of the code for converting rarefaction curve
+#to GGplot object 
+#https://ucdavis-bioinformatics-training.github.io/2021-May-Microbial-Community-Analysis/data_analysis/mca_part2
+#Using rarecurve function on the data frame containing the species counts by
+#site "d" from the code chunk above we generate an object "obj" that contains
+#the resulting rarefaction curves as a list
+obj<-rarecurve(d, step = 1,cex = 0.25,label = F)
+names(obj) = rownames(d)
+
+# Coerce data into "long" form.
+rare_curve <- mapply(FUN = function(x, y) {
+  mydf <- as.data.frame(x)
+  colnames(mydf) <- "value"
+  mydf$Site <- y
+  mydf$subsample <- attr(x, "Subsample")
+  mydf
+}, x = obj, y = as.list(names(obj)), SIMPLIFY = FALSE)
+
+xy <- do.call(rbind, rare_curve)
+rownames(xy) <- NULL  # pretty
+# Plot Rarefaction curve
+diversity_matrix$total<-rowSums(d)
+ggplot(xy,aes(x = subsample, y = value)) +
+  theme_bw() + geom_line() + facet_wrap(~Site) +
+  geom_vline(xintercept=9, color= "red", linetype='dashed') + 
+  labs(title="Sampled Site Rarefaction curves") + xlab("Samples") + 
+  ylab('Species')
+```
+
+
+```{r}
+##Prevalence by site Shannon's H, species evenness, Simpson's Diversity, and
+#expected rarefied species
+#Shannon's H figure
+div_prev<-gathered_results %>%
+  group_by(Shannon_H_index) %>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples )
+CIs<-binom::binom.confint(div_prev$Positve,
+                          div_prev$Samples, methods = "wilson")
+div_prev<-cbind(div_prev, CIs[,5:6])
+
+  ggplot(data=div_prev,aes(x = Shannon_H_index, y = prev)) + 
+    geom_pointrange(aes(ymin = lower, ymax = upper)) +
+  xlab("Shannon H Index") + ylab("Proportion Infected") + 
+  coord_cartesian(ylim = c(0,1))
+#Expected rarefied species figure
+div_prev<-gathered_results %>%
+  group_by(rare) %>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples )
+CIs<-binom::binom.confint(div_prev$Positve,
+                          div_prev$Samples, methods = "wilson")
+div_prev<-cbind(div_prev, CIs[,5:6])
+  ggplot(data=div_prev,aes(x = rare, y = prev)) + 
+    geom_pointrange(aes(ymin = lower, ymax = upper)) +
+  xlab(
+    "Expected Number of Rarified Species 
+    (Min number of samples at a site = 9)") + 
+    ylab("Proportion Infected") + 
+  coord_cartesian(ylim = c(0,1))
+#Simpson's diversity figure
+div_prev<-gathered_results %>%
+  group_by(simp) %>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples )
+CIs<-binom::binom.confint(div_prev$Positve,
+                          div_prev$Samples, methods = "wilson")
+div_prev<-cbind(div_prev, CIs[,5:6])
+  ggplot(data=div_prev,aes(x = simp, y = prev)) + 
+    geom_pointrange(aes(ymin = lower, ymax = upper)) +
+  xlab("Simpson's Diversity Index") + ylab("Proportion Infected") + 
+  coord_cartesian(ylim = c(0,1))
+#Site species evenness figure
+div_prev<-gathered_results %>% mutate(eve=Shannon_H_index/log(spec_num)) %>%
+  group_by(eve) %>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples )
+CIs<-binom::binom.confint(div_prev$Positve,
+                          div_prev$Samples, methods = "wilson")
+div_prev<-cbind(div_prev, CIs[,5:6])
+
+  ggplot(data=div_prev,aes(x = eve, y = prev)) + 
+    geom_pointrange(aes(ymin = lower, ymax = upper)) +
+  xlab("Pielou's Evenness Index") + ylab("Proportion Infected") + 
+  coord_cartesian(ylim = c(0,1))
+#Distribution of site Shannon's H index by country
+number_of_sites <- gathered_results %>% select(Country) %>% 
+  distinct() %>% 
+  mutate(number_sites=c("Sites=1","Sites=7","Sites=8","Sites=1"))
+gathered_results %>% select(Country,Site,Shannon_H_index) %>% 
+  distinct() %>% 
+  ggplot(aes(x=Country, y=Shannon_H_index)) + geom_boxplot() + 
+  coord_cartesian(ylim=c(0,1.6)) + 
+  geom_text(data=number_of_sites,aes(x=Country, y=1.6, 
+                                     label=number_sites),size=3)
+```
+
+```{r}
+#Figures comparing prevalence to fraction of juv. and female samples
+#per site Prevalence by fraction juvenile samples per site
+prev_juv_fraction<-gathered_results %>%
+  group_by(Country,sample_year,Fraction_juv) %>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples )
+
+CIs<-binom::binom.confint(prev_juv_fraction$Positve,
+                          prev_juv_fraction$Samples, methods = "wilson")
+prev_juv_fraction<-cbind(prev_juv_fraction, CIs[,5:6])
+
+prev_juv_fraction %>% ggplot(aes(x=Fraction_juv,y=prev)) + 
+  geom_pointrange(aes(ymin = lower, ymax = upper,y=prev, 
+                      color=sample_year),size=0.3) + 
+  facet_wrap(~Country) + coord_cartesian(ylim = c(0,1), xlim = c(0,1)) +
+  geom_vline(xintercept = 0.5,linetype = "dashed") + 
+  xlab("Proportion of Juvenile Samples at Site") + 
+  ylab("Proportion Infected at Site")
+
+#Prevalence by fraction female samples per site
+prev_female_fraction<-gathered_results %>%
+  group_by(Country,sample_year,Fraction_F) %>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples )
+
+CIs<-binom::binom.confint(prev_female_fraction$Positve,
+                          prev_female_fraction$Samples, methods = "wilson")
+prev_female_fraction<-cbind(prev_female_fraction, CIs[,5:6])
+
+prev_female_fraction %>% ggplot(aes(x=Fraction_F,y=prev)) + 
+  geom_pointrange(aes(ymin = lower, ymax = upper,y=prev, 
+                      color=sample_year),size=0.3) + 
+  facet_wrap(~Country) + coord_cartesian(ylim = c(0,1), xlim = c(0,1)) + 
+  geom_vline(xintercept = 0.5,linetype = "dashed") +
+  xlab("Proportion of Female Samples at Site") + 
+  ylab("Proportion Infected at Site")
+```
+
+```{r}
+##Figures for prevalence, fraction of juv. and females sampled per site, by
+##day of the year
+#Fraction of Juveniles captured by day of the year
+gathered_results %>% 
+  select(Country, Site, Date.of.site.characterization,
+         Fraction_juv, day_of_year) %>% distinct() %>% 
+  ggplot(aes(x=day_of_year,y=Fraction_juv,
+             label=Date.of.site.characterization)) + 
+  geom_point() + facet_wrap(Country~.) + 
+  coord_cartesian(ylim = c(0,1),xlim = c(125,300)) + 
+  ylab("Proportion of Juvenile Samples") + 
+  geom_text(aes(label=Date.of.site.characterization),
+            position=position_jitter(),hjust=1.1, vjust=-1.1,size=2) +
+  xlab("Day of the Year (Jan 1 = day 0)")
+#Fraction of Females captured by day of the year
+gathered_results %>% 
+  select(Country, Site, Date.of.site.characterization,
+         Fraction_F, day_of_year) %>% distinct() %>% 
+  ggplot(aes(x=day_of_year,y=Fraction_F,
+             label=Date.of.site.characterization)) + 
+  geom_point() + facet_wrap(Country~.) + 
+  coord_cartesian(ylim = c(0,1),xlim = c(125,300)) + 
+  ylab("Proportion of Female Samples") + 
+  geom_text(aes(label=Date.of.site.characterization),
+            position=position_jitter(),hjust=1.2, vjust=1.5,size=2) +
+  xlab("Day of the Year (Jan 1 = day 0)")
+#Prevalence by day of year
+prev_day_of_year<-gathered_results %>%
+  group_by(Country, sample_year,day_of_year) %>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples )
+
+CIs<-binom::binom.confint(prev_day_of_year$Positve,
+                          prev_day_of_year$Samples, methods = "wilson")
+prev_day_of_year<-cbind(prev_day_of_year, CIs[,5:6])
+
+prev_day_of_year %>% ggplot(aes(x=day_of_year,y=prev)) + 
+  geom_pointrange(aes(ymin = lower, ymax = upper,y=prev, 
+                      color=sample_year),size=0.3) + 
+  facet_wrap(~Country) + coord_cartesian(ylim = c(0,1),xlim = c(125,300)) +
+  ylab("Prevalence") + xlab("Day of the Year (Jan 1 = day 0)")
+```
+
+```{r}
+#Prevalence plots
+#prevalence by country plot
+country_prev<-gathered_results%>%group_by(Country)%>%
+  summarise(Sites_sampled=length(unique(Site)),Samples=n(),
+            Positve=sum(`CoV_Results`=="1"),prev=Positve/Samples )
+
+CIs <- binom::binom.confint(country_prev$Positve,country_prev$Samples, 
+                            methods = "wilson")
+country_prev <-cbind(country_prev, CIs[,5:6])
+
+country_prev %>% ggplot(aes(x=Country, y=prev)) + 
+  geom_pointrange(aes(ymin = lower, ymax = upper)) +  
+  geom_text(aes(x=Country, y=0.7, label=Samples), size=4) + 
+  xlab("") + ylab("Prevalence") + 
+  ggtitle("Prevalence by Country with 95% CI")
+#overall prevalence estimate for the data set
+prev<-screened_samples %>%
+ summarise(Samples=n(),
+           Positve=sum(`CoV_Results`=="1"),prev=Positve/Samples )
+
+CIs<-binom::binom.confint(prev$Positve,prev$Samples, methods = "wilson")
+prev<-cbind(prev, CIs[,5:6])
+knitr::kable(prev)
+
+#prevalence binned based on number of bat families present at a site
+site_prevs <- gathered_results%>% group_by(Site) %>% 
+  summarise("Number_of_bat_families"=length(unique(Bat.family)), 
+            Samples=n(),
+            Positve=sum(`CoV_Results`=="1"),prev=Positve/Samples )
+CIs <- binom::binom.confint(site_prevs$Positve,site_prevs$Samples, 
+                            methods = "wilson")
+site_prevs <-cbind(site_prevs, CIs[,5:6])
+s_size <- site_prevs %>% group_by(Number_of_bat_families) %>% 
+  summarise(sa=n())
+site_prevs %>% ggplot(aes(x=factor(Number_of_bat_families), y=prev)) + 
+  geom_boxplot() + 
+  geom_text(data=s_size,aes(x=factor(Number_of_bat_families), 
+                            y=0.5, label=sa), size=4) + 
+  geom_point() + xlab("Number of bat families present at a site") + 
+  ylab("Prevalence")
+
+#prevalence binned by the number of species found at each site
+#1 species, 2 species or >3
+site_prevs <- gathered_results%>% group_by(Site) %>% 
+  summarise("Number_of_bat_species"=length(unique(Species)), 
+            Samples=n(),
+            Positve=sum(`CoV_Results`=="1"),prev=Positve/Samples )
+CIs <- binom::binom.confint(site_prevs$Positve,site_prevs$Samples, 
+                            methods = "wilson")
+site_prevs <-cbind(site_prevs, CIs[,5:6])
+site_prevs <-site_prevs%>%
+  mutate(cat=if_else(Number_of_bat_species>=3,">3",
+                     if_else(Number_of_bat_species==2,"2","1"))) %>%
+  mutate(cat=fct_relevel(cat,'1','2',
+                          '>3'))
+s_size <- site_prevs %>% group_by(cat) %>% summarise(sa=n())
+site_prevs %>%
+  ggplot(aes(x=cat, prev))+geom_boxplot() + 
+  geom_point() + 
+  geom_text(data=s_size,aes(x=cat, y=0.5, label=sa), size=4) +
+  xlab("Number of Species per Site")
+
+#prevalence by bat family
+family_prev<-gathered_results%>% group_by(Bat.family) %>% 
+  summarise(Samples=n(),
+            Positve=sum(`CoV_Results`=="1"),prev=Positve/Samples )
+CIs <- binom::binom.confint(family_prev$Positve,family_prev$Samples, 
+                            methods = "wilson")
+family_prev <-cbind(family_prev, CIs[,5:6])
+
+family_prev %>% ggplot(aes(x=Bat.family, y=prev)) + 
+  geom_pointrange(aes(ymin = lower, ymax = upper)) +  
+  geom_text(aes(x=Bat.family, y=0.7, label=Samples), size=4) + 
+  theme(axis.text.x = element_text(angle = 45)) + xlab("") + 
+  ylab("Prevalence") + ggtitle("Prevalence by Bat Family with 95% CI")
+
+#Prevalence by species by age class
+species_greater_than_100_samples<-gathered_results%>%
+  group_by(Species)%>%summarise(s=n())%>%filter(s>100) %>% 
+  droplevels() %>% pull(Species)
+species_prev<-gathered_results %>% group_by(Species,Age)%>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples ) %>% 
+  subset(Species%in%species_greater_than_100_samples)
+CIs<-binom::binom.confint(species_prev$Positve,
+                          species_prev$Samples,methods = "wilson")
+species_prev<-cbind(species_prev, CIs[,5:6])
+species_prev %>% mutate(new_code=paste(Species, Age, sep = "_")) %>%
+  ggplot(aes(x=new_code, y=prev)) + 
+  geom_pointrange(aes(ymin = lower, ymax = upper,color=Age)) +  
+  geom_text(aes(x=new_code, y=0, label=Samples), size=3) + 
+  xlab("") + ylab("Prevalence") + 
+  coord_cartesian(ylim = c(0,1))+
+  facet_grid(~Species,scales = "free_x",space = "free_x",switch = "x") + 
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = "white"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks = element_blank(),
+        strip.text.x = element_text(size = 6,angle = 45))
+
+#Prevalence by species by sex
+species_greater_than_100_samples<-gathered_results%>%
+  group_by(Species)%>%summarise(s=n())%>%filter(s>100) %>% 
+  droplevels() %>% pull(Species)
+species_prev<-gathered_results %>% group_by(Species,Sex)%>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples ) %>% 
+  subset(Species%in%species_greater_than_100_samples)
+CIs<-binom::binom.confint(species_prev$Positve,
+                          species_prev$Samples,methods = "wilson")
+species_prev<-cbind(species_prev, CIs[,5:6])
+species_prev %>% mutate(new_code=paste(Species, Sex, sep = "_")) %>%
+  ggplot(aes(x=new_code, y=prev)) + 
+  geom_pointrange(aes(ymin = lower, ymax = upper,color=Sex)) +  
+  geom_text(aes(x=new_code, y=0, label=Samples), size=3) + 
+  xlab("") + ylab("Prevalence") + 
+  coord_cartesian(ylim = c(0,1))+
+  facet_grid(~Species,scales = "free_x",space = "free_x",switch = "x") + 
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = "white"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks = element_blank(),
+        strip.text.x = element_text(size = 6,angle = 45))
+
+#prevalence by age and sex
+species_greater_than_100_samples<-gathered_results%>%
+  group_by(Species)%>%summarise(s=n())%>%filter(s>100) %>% 
+  droplevels() %>% pull(Species)
+species_prev<-gathered_results %>%
+  subset(Species%in%species_greater_than_100_samples) %>%
+  group_by(Sex,Age)%>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(species_prev$Positve,
+                          species_prev$Samples,methods = "wilson")
+species_prev<-cbind(species_prev, CIs[,5:6])
+species_prev %>% mutate(new_code=paste(Sex, Age, sep = "_")) %>%
+  ggplot(aes(x=new_code, y=prev)) + 
+  geom_pointrange(aes(ymin = lower, ymax = upper,color=Age)) +  
+  geom_text(aes(x=new_code, y=0, label=Samples), size=3) + 
+  xlab("") + ylab("Prevalence") + 
+  coord_cartesian(ylim = c(0,1))+
+  facet_grid(~Sex,scales = "free_x",space = "free_x",switch = "x") + 
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = "white"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks = element_blank(),
+        strip.text.x = element_text(size = 9))
+
+
+```
+
+```{r}
+#prevalence by species by age and sex
+species_greater_than_100_samples<-gathered_results%>%
+  group_by(Species)%>%summarise(s=n())%>%filter(s>100) %>% 
+  droplevels() %>% pull(Species)
+species_prev<-gathered_results %>%
+  subset(Species%in%species_greater_than_100_samples) %>%
+  group_by(Species,Sex,Age)%>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(species_prev$Positve,
+                          species_prev$Samples,methods = "wilson")
+species_prev<-cbind(species_prev, CIs[,5:6])
+species_prev %>% mutate(new_code=paste(Species, Age, sep = "_")) %>%
+  ggplot(aes(x=new_code, y=prev)) + 
+  geom_pointrange(aes(ymin = lower, ymax = upper,color=Age), size=0.5) +  
+  geom_text(aes(x=new_code, y=0.75, label=Samples), size=3) + 
+  xlab("") + ylab("Prevalence") + 
+  coord_cartesian(ylim = c(0,1))+
+  facet_grid(Sex~Species,scales = "free_x",space = "free_x",switch = "x") +
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = "white"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size = 7),
+        axis.title.y = element_text(size = 8),
+        axis.ticks = element_blank(),
+        strip.text.x = element_text(size = 7),
+        strip.text.y = element_text(size = 8))
+```
+
+```{r}
+#georgia turkey sites by species by age
+georgia_turkey_sites<-gathered_results %>% 
+  subset(Species %in%species_greater_than_100_samples) %>% 
+  subset(Country%in%c("Georgia_(GE)","Turkey_(TR)")) %>% 
+  group_by(Site, Species,Age)%>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(georgia_turkey_sites$Positve,
+                        georgia_turkey_sites$Samples,methods = "wilson")
+georgia_turkey_sites<-
+  cbind(georgia_turkey_sites, CIs[,5:6])
+georgia_turkey_sites %>% mutate(new_code=paste(Species, Age, sep = "_")) %>%
+  ggplot(aes(x=new_code, y=prev)) + 
+  geom_pointrange(aes(ymin = lower, ymax = upper,color=Age), size=0.5) + 
+  geom_text(aes(x=new_code, y=0.85, label=Samples), size=3) + 
+  facet_grid(Species~Site ,scales = "free_x",space = "free_x",switch = "x") + 
+  ylab("Prevalence") +
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = "white"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size = 7),
+        axis.title.y = element_text(size = 8),
+        axis.ticks = element_blank(),
+        strip.text.x = element_text(size = 6),
+        strip.text.y = element_text(size = 8))
+
+#Georgia Turkey sites by Species by Sex
+georgia_turkey_sites<-gathered_results %>% 
+  subset(Species %in%species_greater_than_100_samples) %>% 
+  subset(Country%in%c("Georgia_(GE)","Turkey_(TR)")) %>% 
+  group_by(Site, Species,Sex)%>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(georgia_turkey_sites$Positve,
+                        georgia_turkey_sites$Samples,methods = "wilson")
+georgia_turkey_sites<-
+  cbind(georgia_turkey_sites, CIs[,5:6])
+georgia_turkey_sites %>% mutate(new_code=paste(Species, Sex, sep = "_")) %>%
+  ggplot(aes(x=new_code, y=prev)) + 
+  geom_pointrange(aes(ymin = lower, ymax = upper,color=Sex), size=0.5) + 
+  geom_text(aes(x=new_code, y=0.85, label=Samples), size=3) + 
+  facet_grid(Species~Site ,scales = "free_x",space = "free_x",switch = "x") + 
+  ylab("Prevalence") +
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = "white"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size = 7),
+        axis.title.y = element_text(size = 8),
+        axis.ticks = element_blank(),
+        strip.text.x = element_text(size = 6),
+        strip.text.y = element_text(size = 8))
+
+```
+
+```{r}
+#jordan az sites by species by age
+jordan_az_sites<-gathered_results %>% 
+  subset(Species %in%species_greater_than_100_samples) %>% 
+  subset(Country%in%c("Azerbaijan_(AZ)","Jordan_(JO)")) %>% 
+  group_by(Site, Species,Age)%>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(jordan_az_sites$Positve,
+                        jordan_az_sites$Samples,methods = "wilson")
+jordan_az_sites<-
+  cbind(jordan_az_sites, CIs[,5:6])
+jordan_az_sites %>% mutate(new_code=paste(Species, Age, sep = "_")) %>%
+  ggplot(aes(x=new_code, y=prev)) + 
+  geom_pointrange(aes(ymin = lower, ymax = upper,color=Age), size=0.5) + 
+  geom_text(aes(x=new_code, y=0.85, label=Samples), size=3) + 
+  facet_grid(Species~Site ,scales = "free_x",space = "free_x",switch = "x") + 
+  ylab("Prevalence") +
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = "white"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size = 7),
+        axis.title.y = element_text(size = 8),
+        axis.ticks = element_blank(),
+        strip.text.x = element_text(size = 6),
+        strip.text.y = element_text(size = 8))
+
+#jordan az sites by Species by Sex
+jordan_az_sites<-gathered_results %>% 
+  subset(Species %in%species_greater_than_100_samples) %>% 
+  subset(Country%in%c("Azerbaijan_(AZ)","Jordan_(JO)")) %>% 
+  group_by(Site, Species,Sex)%>% 
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(jordan_az_sites$Positve,
+                        jordan_az_sites$Samples,methods = "wilson")
+jordan_az_sites<-
+  cbind(jordan_az_sites, CIs[,5:6])
+jordan_az_sites %>% mutate(new_code=paste(Species, Sex, sep = "_")) %>%
+  ggplot(aes(x=new_code, y=prev)) + 
+  geom_pointrange(aes(ymin = lower, ymax = upper,color=Sex), size=0.5) + 
+  geom_text(aes(x=new_code, y=0.85, label=Samples), size=3) + 
+  facet_grid(Species~Site ,scales = "free_x",space = "free_x",switch = "x") + 
+  ylab("Prevalence") +
+  theme(strip.placement = "outside",
+        strip.background = element_rect(fill = "white"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size = 7),
+        axis.title.y = element_text(size = 8),
+        axis.ticks = element_blank(),
+        strip.text.x = element_text(size = 6),
+        strip.text.y = element_text(size = 8))
+```
+
+```{r}
+#trapping at cave/mine or not
+cave_mine<-gathered_results %>% group_by(Trapping.at.a.cave.or.mine.)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(cave_mine$Positve,
+                        cave_mine$Samples,methods = "wilson")
+cave_mine<-
+  cbind(cave_mine, CIs[,5:6])
+cave_mine %>% ggplot(aes(x=Trapping.at.a.cave.or.mine.,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=Trapping.at.a.cave.or.mine., y=0.85, label=Samples), 
+            size=3) + 
+  ylab("Prevalence")+coord_cartesian(ylim = c(0,1))
+```
+
+```{r}
+#reproductive status figure
+repro_status<-gathered_results %>% 
+  group_by(male_female_reproductive_status)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(repro_status$Positve,
+                        repro_status$Samples,methods = "wilson")
+repro_status<-
+  cbind(repro_status, CIs[,5:6])
+repro_status %>% ggplot(aes(x=male_female_reproductive_status,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=male_female_reproductive_status, y=0.85, label=Samples), 
+            size=3) + ylab("Prevalence")+coord_cartesian(ylim = c(0,1)) + 
+  theme(axis.text.x = element_text(size = 8, angle=45))
+
+#reproductive status figure filtered for just rhinolophus ferrumequinum
+repro_status<-gathered_results %>% 
+  filter(Species =="Rhinolophus_ferrumequinum" ) %>%
+  group_by(male_female_reproductive_status)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(repro_status$Positve,
+                        repro_status$Samples,methods = "wilson")
+repro_status<-
+  cbind(repro_status, CIs[,5:6])
+repro_status %>% ggplot(aes(x=male_female_reproductive_status,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=male_female_reproductive_status, y=0.85, label=Samples), 
+            size=3) + ylab("Prevalence")+coord_cartesian(ylim = c(0,1)) + 
+  theme(axis.text.x = element_text(size = 8, angle=45)) + 
+  ggtitle("Rhinolophus_ferrumequinum")
+
+#reproductive status figure filtered for just Rhinolophus_euryale
+repro_status<-gathered_results %>% 
+  filter(Species =="Rhinolophus_euryale" ) %>%
+  group_by(male_female_reproductive_status)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(repro_status$Positve,
+                        repro_status$Samples,methods = "wilson")
+repro_status<-
+  cbind(repro_status, CIs[,5:6])
+repro_status %>% 
+  ggplot(aes(x=male_female_reproductive_status,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=male_female_reproductive_status, y=0.85, label=Samples), 
+            size=3) + ylab("Prevalence")+coord_cartesian(ylim = c(0,1)) + 
+  theme(axis.text.x = element_text(size = 8, angle=45)) + 
+  ggtitle("Rhinolophus_euryale")
+
+#reproductive status figure filtered for just Rousettus_aegyptiacus
+repro_status<-gathered_results %>% 
+  filter(Species =="Rousettus_aegyptiacus" ) %>%
+  group_by(male_female_reproductive_status)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(repro_status$Positve,
+                        repro_status$Samples,methods = "wilson")
+repro_status<-
+  cbind(repro_status, CIs[,5:6])
+repro_status %>% 
+  ggplot(aes(x=male_female_reproductive_status,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=male_female_reproductive_status, y=0.85, label=Samples), 
+            size=3) + ylab("Prevalence")+coord_cartesian(ylim = c(0,1)) + 
+  theme(axis.text.x = element_text(size = 8, angle=45)) + 
+  ggtitle("Rousettus_aegyptiacus")
+```
+
+```{r}
+#attached pup
+pup_status<-gathered_results %>% group_by(Attached.pup.)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(pup_status$Positve,
+                        pup_status$Samples,methods = "wilson")
+pup_status<-
+  cbind(pup_status, CIs[,5:6])
+pup_status %>% ggplot(aes(x=Attached.pup.,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=Attached.pup., y=0.85, label=Samples), size=3) + 
+  ylab("Prevalence")+coord_cartesian(ylim = c(0,1)) + 
+  theme(axis.text.x = element_text(size = 8, angle=45))
+
+```
+
+```{r}
+#human density
+human_density<-gathered_results %>% 
+  group_by(Human.population.size.in.1.km.radius.of.site.)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(human_density$Positve,
+                        human_density$Samples,methods = "wilson")
+human_density<-
+  cbind(human_density, CIs[,5:6])
+human_density %>% 
+  ggplot(aes(x=Human.population.size.in.1.km.radius.of.site.,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=Human.population.size.in.1.km.radius.of.site., y=0.85, 
+                label=Samples), size=3) + 
+  ylab("Prevalence") + coord_cartesian(ylim = c(0,1)) + 
+  theme(axis.text.x = element_text(size = 8, angle=45))
+
+#density for just rhinolophus ferrumequinum
+human_density<-gathered_results %>% 
+  filter(Species=="Rhinolophus_ferrumequinum") %>% 
+  group_by(Human.population.size.in.1.km.radius.of.site.)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(human_density$Positve,
+                        human_density$Samples,methods = "wilson")
+human_density<-
+  cbind(human_density, CIs[,5:6])
+human_density %>% 
+  ggplot(aes(x=Human.population.size.in.1.km.radius.of.site.,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=Human.population.size.in.1.km.radius.of.site., y=0.85, 
+                label=Samples), size=3) + 
+  ylab("Prevalence") + coord_cartesian(ylim = c(0,1)) + 
+  theme(axis.text.x = element_text(size = 8, angle=45)) + 
+  ggtitle("Rhinolophus_ferrumequinum")
+
+```
+
+```{r}
+#Site accessibility
+accessibility<-gathered_results %>% group_by(Site.accessibility)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(accessibility$Positve,
+                        accessibility$Samples,methods = "wilson")
+accessibility<-
+  cbind(accessibility, CIs[,5:6])
+accessibility %>% ggplot(aes(x=Site.accessibility,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=Site.accessibility, y=0.85, label=Samples), size=3) + 
+  ylab("Prevalence")+coord_cartesian(ylim = c(0,1)) + 
+  theme(axis.text.x = element_text(size = 8, angle=45))
+
+#Site accessibility for Rhinolophus_ferrumequinum
+accessibility<-gathered_results %>% 
+  filter(Species =="Rhinolophus_ferrumequinum") %>% 
+  group_by(Site.accessibility)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(accessibility$Positve,
+                        accessibility$Samples,methods = "wilson")
+accessibility<-
+  cbind(accessibility, CIs[,5:6])
+accessibility %>% ggplot(aes(x=Site.accessibility,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=Site.accessibility, y=0.85, label=Samples), size=3) + 
+  ylab("Prevalence") + coord_cartesian(ylim = c(0,1)) + 
+  theme(axis.text.x = element_text(size = 8, angle=45)) + 
+  ggtitle("Rhinolophus_ferrumequinum")
+```
+
+```{r}
+#frequency visitation
+frequency_visit<-gathered_results %>% 
+  group_by(Frequency.of.human.visitation.to.the.site)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(frequency_visit$Positve,
+                        frequency_visit$Samples,methods = "wilson")
+frequency_visit<-
+  cbind(frequency_visit, CIs[,5:6])
+frequency_visit %>% 
+  ggplot(aes(x=Frequency.of.human.visitation.to.the.site,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=Frequency.of.human.visitation.to.the.site, y=0.85, 
+                label=Samples), size=3) + ylab("Prevalence")+
+  coord_cartesian(ylim = c(0,1)) + 
+  theme(axis.text.x = element_text(size = 8, angle=45))
+
+#frequency visitation Rhinolophus_ferrumequinum
+frequency_visit<-gathered_results %>% 
+  filter(Species =="Rhinolophus_ferrumequinum") %>% 
+  group_by(Frequency.of.human.visitation.to.the.site)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(frequency_visit$Positve,
+                        frequency_visit$Samples,methods = "wilson")
+frequency_visit<-
+  cbind(frequency_visit, CIs[,5:6])
+frequency_visit %>% 
+  ggplot(aes(x=Frequency.of.human.visitation.to.the.site,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=Frequency.of.human.visitation.to.the.site, y=0.85, 
+                label=Samples), size=3) + ylab("Prevalence")+
+  coord_cartesian(ylim = c(0,1)) + 
+  theme(axis.text.x = element_text(size = 8, angle=45)) + 
+  ggtitle("Rhinolophus_ferrumequinum")
+```
+
+```{r}
+#prevalence by water present at site
+water_present<-gathered_results %>% group_by(Water.present.at.the.site.)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(water_present$Positve,
+                        water_present$Samples,methods = "wilson")
+water_present<-
+  cbind(water_present, CIs[,5:6])
+water_present %>% ggplot(aes(x=Water.present.at.the.site.,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=Water.present.at.the.site., y=0.85, label=Samples), 
+            size=3) + ylab("Prevalence")+
+  coord_cartesian(ylim = c(0,1)) + 
+  theme(axis.text.x = element_text(size = 8, angle=45))
+```
+
+```{r}
+#prevalence by lab samples sent to
+lab_used<-gathered_results %>% group_by(lab)%>%
+  summarise(Samples=n(),Positve=sum(`CoV_Results`=="1"),
+            prev=Positve/Samples)
+CIs<-binom::binom.confint(lab_used$Positve,
+                        lab_used$Samples,methods = "wilson")
+lab_used<-
+  cbind(lab_used, CIs[,5:6])
+lab_used %>% ggplot(aes(x=lab,y=prev)) + 
+  geom_pointrange(aes(ymin=lower, ymax=upper)) + 
+  geom_text(aes(x=lab, y=0.85, label=Samples), size=3) + 
+  ylab("Prevalence")+coord_cartesian(ylim = c(0,1)) + 
+  theme(axis.text.x = element_text(size = 8, angle=45))
+
+```
+
+##Running NMDS Analysis
+
+```{r}
+#Set seed for random number generator and run NMDS
+set.seed(1)
+#Build data frame for vegan package
+diversity_frame<-data.frame(gathered_results %>% group_by(Site, Species) %>% 
+  summarise(Samples = n()) %>% 
+  pivot_wider(names_from = Species, 
+              values_from = Samples, values_fill = c(Samples=0)),row.names = TRUE)
+#running NMDS
+test=vegan::metaMDS(diversity_frame,k=2,weakties=FALSE,trymax = 100)
+#Extract NMDS scores for plotting axis
+data_scores<-as.data.frame(vegan::scores(test))
+data_scores$Site <- rownames(data_scores)
+data_scores<-data_scores %>% relocate(Site)
+data_scores<-left_join(data_scores,gathered_results,by="Site") %>% select(Site, NMDS1,NMDS2,Country) %>% distinct()
+#I went through this process for each bat family to generater the dataframe with the present absence for each family. Emball..did not get a color code due to small sample size
+#build data frame for each Bat family for coloring points Emballonuridae was
+#not included due to sample size. There's likely a way to automate adding
+#these families to the data frame.
+#Vespertilionidae being added
+data_scores<-left_join(data_scores, gathered_results %>% 
+            group_by(Site, Bat.family) %>% 
+  summarise(Samples = n()) %>% 
+  pivot_wider(names_from = Bat.family, 
+              values_from = Samples, values_fill = c(Samples=0))%>%
+  select(Vespertilionidae) %>% 
+  mutate(Vesp_present=if_else(`Vespertilionidae`==0,"No","Yes"))%>%
+    select(Vesp_present), by="Site") %>% mutate_if(is.character, as.factor)
+#Miniopteridae being added
+data_scores<-left_join(data_scores, gathered_results %>% 
+            group_by(Site, Bat.family) %>% 
+  summarise(Samples = n()) %>% 
+  pivot_wider(names_from = Bat.family, 
+              values_from = Samples, values_fill = c(Samples=0))%>%
+  select(Miniopteridae) %>% 
+  mutate(Mini_present=if_else(`Miniopteridae`==0,"No","Yes"))%>%
+    select(Mini_present), by="Site") %>% mutate_if(is.character, as.factor)
+#Pteropodidae being added
+data_scores<-left_join(data_scores, gathered_results %>% 
+            group_by(Site, Bat.family) %>% 
+  summarise(Samples = n()) %>% 
+  pivot_wider(names_from = Bat.family, 
+              values_from = Samples, values_fill = c(Samples=0))%>%
+  select(Pteropodidae) %>% 
+  mutate(Ptero_present=if_else(`Pteropodidae`==0,"No","Yes"))%>%
+    select(Ptero_present), by="Site") %>% mutate_if(is.character, as.factor)
+#Rhinolophidae being added
+data_scores<-left_join(data_scores, gathered_results %>% 
+            group_by(Site, Bat.family) %>% 
+  summarise(Samples = n()) %>% 
+  pivot_wider(names_from = Bat.family, 
+              values_from = Samples, values_fill = c(Samples=0))%>%
+  select(Rhinolophidae) %>% 
+  mutate(Rhino_present=if_else(`Rhinolophidae`==0,"No","Yes"))%>%
+    select(Rhino_present), by="Site") %>% mutate_if(is.character, as.factor)
+#Rhinopomatidae being added
+data_scores<-left_join(data_scores, gathered_results %>% 
+            group_by(Site, Bat.family) %>% 
+  summarise(Samples = n()) %>% 
+  pivot_wider(names_from = Bat.family, 
+              values_from = Samples, values_fill = c(Samples=0))%>%
+  select(Rhinopomatidae) %>% 
+  mutate(Rhinopo_present=if_else(`Rhinopomatidae`==0,"No","Yes"))%>%
+    select(Rhinopo_present), by="Site") %>% mutate_if(is.character, as.factor)
+#restructuring data frame for plotting
+gathered_scores<-data_scores %>% 
+  pivot_longer(5:9,names_to = "family", values_to = "present")
+#plot NMDS figure
+gathered_scores %>% mutate(family=
+                             recode(family, 
+                                Mini_present="Miniopteridae",
+                              Ptero_present="Pteropodidae",
+                              Rhino_present="Rhinolophidae",
+                              Rhinopo_present="Rhinopomatidae",
+                              Vesp_present="Vespertilionidae"))%>%
+  ggplot() + geom_point(aes(x=NMDS1,y=NMDS2,shape=Country,colour=present),
+                        size=3)+
+  scale_colour_manual(values=c("No" = "red", "Yes" = "blue")) +
+  theme_bw()+theme(axis.text.x = element_blank(),  # remove x-axis text
+        axis.text.y = element_blank(), # remove y-axis text
+        axis.ticks = element_blank(),  # remove axis ticks
+        axis.title.x = element_text(size=18), # remove x-axis labels
+        axis.title.y = element_text(size=18), # remove y-axis labels
+        panel.background = element_blank(), 
+        panel.grid.major = element_blank(),  #remove major-grid labels
+        panel.grid.minor = element_blank(),  #remove minor-grid labels
+        plot.background = element_blank()) +
+  geom_text(data=data_scores,aes(x=NMDS1,y=NMDS2,label=Site),
+            size=2.5,vjust=1) + facet_wrap(~family)
+#Extract stress value from NMDS analysis with 2 dimensions.
+test$stress
+```
+##Generate correlation matrix between predictor variables
+```{r}
+predictor_set <- gathered_results %>% 
+  select(Bat.family,Age,Sex,Species,lab,genus,Shannon_H_index_cs,
+         Country,Fraction_juv_cs,Fraction_F_cs,
+         Human.population.size.in.1.km.radius.of.site.,
+         Trapping.at.a.cave.or.mine.,Site.accessibility,
+         Frequency.of.human.visitation.to.the.site,
+         Water.present.at.the.site.,CoV_Results)
+predictor_correlations<-
+  polycor::hetcor(predictor_set,use="pairwise.complete.obs")
+predictor_correlations$correlations
+```
+
+##Modeling prevalence using Bat Family identity as taxonomic level
+
+```{r}
+#subset data to remove bat family Emballonuridae do to sample size
+subset_bat_family<-gathered_results %>%
+  subset(Bat.family!= "Emballonuridae")%>%droplevels()
+```
+
+```{r}
+#Using cross-validation identified best performing alpha value for the
+#elastic-net regression. An alpha closer to 0 performs similar to a Ridge
+#regression. While an alpha closer to 1 performs like LASSO enabling
+#predictor coefficients to shrink to zero. This cross-validator took ~20 mins
+#to complete.
+#Setting the seed enables reproducable results
+set.seed(1)
+#set number of trails (how many rounds of cross-validation) and what
+#fraction of data will be set to Training and Testing sets
+trials <- 50
+split <- 0.66
+#set up a sequence of alpha values for testing
+a <-seq(0.01, 0.99, 0.09)
+#create object to direct results to
+Test.error.enet <- matrix(ncol=length(a), nrow=trials)
+for(i in 1:trials){
+#print which round cross-validator is on
+print(i)
+index<-sample(nrow(subset_bat_family), nrow(subset_bat_family)*split)
+Train <- subset_bat_family %>% slice(index)
+Test <- subset_bat_family %>% slice(-index)
+#The model matrix needs to be set for both testing and training sets
+Model.Matrix.Test<-model.matrix(
+  lm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (Bat.family+Age+Sex)^2, data=Test))
+Model.Matrix.Train<-model.matrix(
+  lm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (Bat.family+Age+Sex)^2, data=Train))
+for(iter in 1:length(a)){
+#fit elastic-net fit for each of the different alpha values
+enet.fit <- 
+  cv.glmnet(Model.Matrix.Train,Train$CoV_Results,family="binomial",
+            type.measure = "auc",alpha=a[iter])
+#generate predictions for the alpha value using the test set
+enet.preds <- 
+  predict(enet.fit, newx = Model.Matrix.Test, 
+          s = "lambda.min",type='response')
+#generate receiver operator curve for the elastic-net model at a given alpha
+roc.data<-data.frame(Predictions=enet.preds,
+                     known.class=Test$CoV_Results)
+enet_proc<-pROC::roc(roc.data$known.class, roc.data$lambda.min, quiet=TRUE)
+#extract the area under the receiver operator curve for a given alpha
+#and store the value
+Test.error.enet[i, iter]<-pROC::auc(enet_proc)
+}
+}
+```
+
+```{r}
+#Taking the output from the cross-validator above we can generate some
+#figures to assess the results and identify best alpha value
+#set column names for each alpha value tested
+name<-vector(length = length(a))
+for(i in 1:length(a)){
+  name[i]<-paste0("alpha_",a[i])
+}
+colnames(Test.error.enet)<-name
+#build dataframe
+AUC_alpha_value_evaluation<-
+  data.frame(cbind(trial=1:nrow(Test.error.enet),Test.error.enet))
+#Export data frame to working directory. This prevents us from having to
+#re-run the cross-validator
+write.table(AUC_alpha_value_evaluation, 
+            file = "AUC_alpha_value_family_evalutation.csv", 
+            sep = ",", quote = FALSE, row.names = F)
+#generate box plots of AUC for each alpha
+boxplot(Test.error.enet, names=a, 
+        xlab='alpha value', ylab='Area Under Curve')
+#identify which alpha value performed best. The best alpha is the one that
+#produces the highest area under the curve values.
+col_index<-which(colMeans(Test.error.enet)==
+                   max(colMeans(Test.error.enet)))
+a[col_index]
+max(colMeans(Test.error.enet))
+```
+
+```{r,warning=FALSE, message=FALSE}
+#Running 2-fold cross-validation for 50 trials a total of 100 rounds
+#identifying best model using AUC
+set.seed(1)
+#set the number of trials and number of folds
+trials=50
+k=2
+#set up objects for AUC values to be stored
+BIC_model <- matrix(ncol=k, nrow=trials)
+AIC_model <- matrix(ncol=k, nrow=trials)
+LASSO_model <- matrix(ncol=k, nrow=trials)
+Ridge_model <- matrix(ncol=k, nrow=trials)
+Enet_model <- matrix(ncol=k, nrow=trials)
+#for nested for loop for 1:trials and 1:to number of folds
+for(j in 1:trials){
+print(j)
+#create folds using caret package
+fold<-createFolds(subset_bat_family$CoV_Results, k =k)
+for(i in 1:length(fold)){
+#setting up testing and training sets
+Train <- subset_bat_family %>% slice(-fold[[i]])
+Test <- subset_bat_family %>% slice(fold[[i]])
+#setting model matrix for the regularization methods
+Model.Matrix.Test<-model.matrix(
+  lm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (Bat.family+Age+Sex)^2, data=Test))
+Model.Matrix.Train<-model.matrix(
+  lm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (Bat.family+Age+Sex)^2, data=Train))
+
+#BIC model running step function to identify best model using step function
+#and BIC selection criteria. Make predictions based on new data and
+#calculate AUC ROC
+m <- step(glm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (Bat.family+Age+Sex)^2, data=Train, family = binomial), 
+                    k = log(dim(Train)[1]), trace=FALSE,direction="both")
+preds.m<-predict(m,Test,type='response')
+roc.data<-data.frame(Predictions=preds.m,
+                     known.class=Test$CoV_Results)
+model_proc<-pROC::roc(roc.data$known.class, 
+                      roc.data$Predictions, quiet=TRUE)
+BIC_model[j,i]<-pROC::auc(model_proc)
+
+#AIC model running step function to identify best model using step function
+#and AIC selection criteria. Make predictions based on new data and
+#calculate AUC ROC
+m <- step(glm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (Bat.family+Age+Sex)^2, data=Train, family = binomial), 
+                    k = 2, trace=FALSE,direction="both")
+preds.m<-predict(m,Test,type='response')
+roc.data<-data.frame(Predictions=preds.m,
+                     known.class=Test$CoV_Results)
+model_proc<-pROC::roc(roc.data$known.class, 
+                      roc.data$Predictions, quiet=TRUE)
+AIC_model[j,i]<-pROC::auc(model_proc)
+
+#LASSO model. Make predictions based on new data and
+#calculate AUC ROC
+lasso.fit <- 
+  cv.glmnet(Model.Matrix.Train,Train$CoV_Results,family="binomial",
+            type.measure = "auc",alpha=1)
+lasso.preds <- 
+  predict(lasso.fit, newx = Model.Matrix.Test, 
+          s = "lambda.min",type='response')
+roc.data<-data.frame(Predictions=lasso.preds,
+                     known.class=Test$CoV_Results)
+lasso_proc<-pROC::roc(roc.data$known.class, roc.data$lambda.min, quiet=TRUE)
+LASSO_model[j,i]<-pROC::auc(lasso_proc)
+
+#Ridge model. Make predictions based on new data and calculate AUC ROC
+ridge.fit <- 
+  cv.glmnet(Model.Matrix.Train,Train$CoV_Results,family="binomial",
+            type.measure = "auc",alpha=0)
+ridge.preds <- 
+  predict(ridge.fit, newx = Model.Matrix.Test, 
+          s = "lambda.min",type='response')
+roc.data<-data.frame(Predictions=ridge.preds,
+                     known.class=Test$CoV_Results)
+ridge_proc<-pROC::roc(roc.data$known.class, roc.data$lambda.min, quiet=TRUE)
+Ridge_model[j,i]<-pROC::auc(ridge_proc)
+
+#enet model. Here we can enter the alpha value identified above in "alpha="
+#make predictions based on new data and calculate AUC ROC.
+enet.fit <- 
+  cv.glmnet(Model.Matrix.Train,Train$CoV_Results,family="binomial",
+            type.measure = "auc",alpha=0.55)
+enet.preds <- 
+  predict(enet.fit, newx = Model.Matrix.Test, 
+          s = "lambda.min",type='response')
+roc.data<-data.frame(Predictions=enet.preds,
+                     known.class=Test$CoV_Results)
+enet_proc<-pROC::roc(roc.data$known.class, roc.data$lambda.min, quiet=TRUE)
+Enet_model[j,i]<-pROC::auc(enet_proc)
+
+}
+}
+#Build data frame of summary from cross-validation for plotting and
+#summary statistics and statistical significance between model AUC
+family_cv.summary.df<-rbind(data.frame(
+  auc=as.vector(BIC_model), 
+                      Model=rep("BIC", 
+                                 length=length(as.vector(BIC_model)))),
+  data.frame(auc=as.vector(AIC_model),
+             Model=rep("AIC",
+                       length=length(as.vector(AIC_model)))),
+  data.frame(auc=as.vector(LASSO_model),
+             Model=rep("LASSO",
+                       length=length(as.vector(LASSO_model)))),
+  data.frame(auc=as.vector(Ridge_model),
+             Model=rep("Ridge",
+                       length=length(as.vector(Ridge_model)))),
+   data.frame(auc=as.vector(Enet_model),
+             Model=rep("ENet",
+                       length=length(as.vector(Enet_model)))))
+#generate summary statistics
+knitr::kable(family_cv.summary.df %>% group_by(Model) %>% 
+               summarise(Mean.test.set.auc=mean(auc)%>% 
+                           round(4), Sd=sd(auc)%>% round(4)))
+#generate plot of AUC for models
+family_cv.summary.df %>%
+  ggplot(aes(x=auc)) +geom_boxplot(aes(fill=Model)) + theme_bw()+
+  theme(axis.text.y = element_blank(),axis.ticks.y = element_blank()) + 
+  xlab("Area Under the Curve")
+#run wilcox tests for statistical comparisions
+pairwise.wilcox.test(
+  family_cv.summary.df$auc,family_cv.summary.df$Model,paired = TRUE)
+```
+
+```{r}
+#generate bootstrapped coefficients for top performing model based on
+#cross-validation the model chosen for this loop was Ridge
+sample_size=nrow(subset_bat_family)
+#set the number of rounds of replication
+trials<-1000
+#tell R how many cores are available
+registerDoParallel(2)
+#run using a "foreach" loop allows for parallel runs
+#each round will be sent to the object "predictor_bootstrap_values"
+#"system.time" will tell us how long this ran for
+system.time(predictor_bootstrap_coefficients<-
+              foreach (j=1:trials,.combine = rbind) %dopar% {
+#setting the seed for each round allows for reproducible results when
+#running in parallel
+  set.seed(j)
+index <- sample(1:sample_size, sample_size, replace=TRUE)
+Boot.temp <- subset_bat_family %>% slice(index)
+Model.Matrix<-model.matrix(
+  lm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (Bat.family+Age+Sex)^2, data=Boot.temp))
+Ridge.cv <- cv.glmnet(Model.Matrix,Boot.temp$CoV_Results,
+                      family="binomial",
+            type.measure = "auc",alpha=0)
+#extract coefficients for each run and they will be stored in the object
+#"predictor_bootstrap_values" set above
+as.numeric(coef(Ridge.cv, s="lambda.min"))
+})
+```
+
+```{r}
+#generate a list of coefficients used in the Ridge model.
+#This was done by pointing the "coef" function to the fitted ridge model
+#in the cross-validator loop.
+names_coef<-row.names(coef(ridge.fit, s="lambda.min"))
+#converting the output from the bootstrap object to a data frame and
+#renaming the column headers
+predictor_bootstrap_coefficients<-
+  data.frame(predictor_bootstrap_coefficients)
+colnames(predictor_bootstrap_coefficients)<-names_coef
+#add a column of numbers for each round of replication, and remove
+#the 2nd intercept coefficient that glmnet generates when fitting models
+predictor_bootstrap_coefficients<-
+  data.frame(cbind(bs_replicate=1:nrow(predictor_bootstrap_coefficients),
+                   predictor_bootstrap_coefficients)) %>% 
+  select(-X.Intercept..1)
+#write the table to a .csv in the working directory
+#to avoid re-running the loop
+write.table(predictor_bootstrap_coefficients, 
+            file = "ridge_family_bootstrap_table_1000.csv", 
+            sep = ",", quote = FALSE, row.names = F)
+```
+
+```{r}
+predictor_bootstrap_coefficients <- predictor_bootstrap_coefficients %>% 
+  select(-bs_replicate)
+#Generate histogram of coefficients for each predictor
+predictor_bootstrap_coefficients %>% 
+  pivot_longer(cols = everything(), names_to="Predictor", 
+               values_to="Estimate") %>% 
+  ggplot()+facet_wrap(~Predictor,scales = "free_x") + 
+  geom_histogram(aes(x=Estimate),bins = 20)
+#generate mean estimate for each coefficient
+Mean.estimate<-predictor_bootstrap_coefficients %>% 
+  pivot_longer(everything(),names_to = "Predictor", 
+               values_to="estimate") %>% group_by(`Predictor`) %>% 
+  summarise(Mean=mean(`estimate`))
+#generate Bias Corrected and Adjusted 95% CI for each coefficient
+BCA_intervals<-
+  matrix(ncol = 2, nrow = ncol(predictor_bootstrap_coefficients))
+for (i in 1:ncol(predictor_bootstrap_coefficients)) {
+ BCA_intervals[i,]<-coxed::bca(predictor_bootstrap_coefficients[,i])
+}
+colnames(BCA_intervals)<-c("lwr","upr")
+BCA_interval_frame<-
+  data.frame(Predictor=
+               colnames(predictor_bootstrap_coefficients), 
+             BCA_intervals)
+#joining mean estimate and 95% CI for coefficients
+#If the confidence interval contains zero on the logit scale the predictor
+#is not considered to be significant
+logit_scale_coefficient_summary<-
+  left_join(Mean.estimate, BCA_interval_frame, 
+                     by="Predictor") %>%
+  mutate("contains.zero?"=
+           ifelse(
+             `lwr`<=0 & `upr`>=0,
+             "Y","N"))
+#These next few lines of code require manual curation of the coefficient
+#summary output to generate a plot of significant coefficients
+#generate a subset of significant predictors
+keep<-logit_scale_coefficient_summary %>% filter(`contains.zero?`=="N")
+#create a separate list of predictors that have one factor level identified
+#as significant. For example if Bat family Rhinolophidae was identified as
+#significant than "Bat.family" is a significant predictor of prevalence.
+#However, filtering the coefficient summary using the filter command on line
+#1340 removes all "Bat.family" coefficients. Since we're saying bat family
+#identity matters we need to capture all "Bat.family" coefficients significant
+#or not.
+keep2<-logit_scale_coefficient_summary %>% 
+  filter(str_detect(Predictor, 
+                    "Frequency.of.human.visitation.to.the.site") | 
+           str_detect(Predictor, "Bat.family")|
+           str_detect(Predictor, "Age")|
+           str_detect(Predictor, 
+                      "Human.population.size.in.1.km.radius.of.site.")|
+           str_detect(Predictor, "SexMale_.M.")|
+           str_detect(Predictor, "X.Intercept.")== TRUE) %>%
+  subset(!Predictor %in% c("AgeJuvenile_.J..SexMale_.M."))
+#Merge 2 objects containing significant predictors
+retained_predictors<-rbind(keep,keep2) %>% distinct()
+#Converted coefficients to probability values. Needed "faraway" package
+#to have this "ilogit" function used to convert coefficients. If the
+#confidence interval contains 0.5 the predictor is not significant
+retained_predictors %>% mutate(Predictor = fct_reorder(Predictor, Mean),
+                               Mean=faraway::ilogit(Mean),
+                               lwr=faraway::ilogit(lwr),
+                               upr=faraway::ilogit(upr)) %>% 
+  rename("Contains 0.5?"="contains.zero?") %>%
+#pass this into ggplot for figrue
+ggplot()+
+  geom_pointrange(aes(x=Predictor, 
+                      y=Mean,ymin=lwr,ymax=upr,color=`Contains 0.5?`)) + 
+  geom_hline(yintercept = 0.5,linetype="dashed", color = "red") +
+  coord_flip() + ylab("Probability of Infection") + xlab("") + 
+  ggtitle("Bat family Ridge Model")
+
+```
+
+##Modeling prevalence using genus as taxonomic level
+
+```{r}
+#generate a list of genera that have 100 samples or greater
+genera_greater_100<-gathered_results %>% group_by(genus)%>%
+  summarise(s=n()) %>% filter(s>100) %>% pull(genus) %>% droplevels()
+#subset the data to only include those genera
+genera_subset<-gathered_results %>% subset(genus %in% genera_greater_100) %>% droplevels()
+```
+
+These next chunks of code are almost identical to the Bat.family modeling.
+The biggest difference might be evaluating the output of the bootstrapping.
+Predictors identified as significant between the family and genus models might
+differ and so manually curating the results to be able to plot model outputs
+will be different.
+
+```{r,warning=FALSE, message=FALSE}
+#Identified what alpha value performs best for enet 
+#took at least 20 min
+set.seed(1)
+trials <- 50
+split <- 0.66
+a <-seq(0, 0.99, 0.09)
+Test.error.enet <- matrix(ncol=length(a), nrow=trials)
+for(i in 1:trials){
+print(i)
+index<-sample(nrow(genera_subset), nrow(genera_subset)*split)
+Train <- genera_subset %>% slice(index)
+Test <- genera_subset %>% slice(-index)
+Model.Matrix.Test<-model.matrix(
+  lm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (genus+Age+Sex)^2, data=Test))
+Model.Matrix.Train<-model.matrix(
+  lm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (genus+Age+Sex)^2, data=Train))
+for(iter in 1:length(a)){
+enet.fit <- 
+  cv.glmnet(Model.Matrix.Train,Train$CoV_Results,family="binomial",
+            type.measure = "auc",alpha=a[iter])
+enet.preds <- 
+  predict(enet.fit, newx = Model.Matrix.Test, 
+          s = "lambda.min",type='response')
+roc.data<-data.frame(Predictions=enet.preds,
+                     known.class=Test$CoV_Results)
+enet_proc<-pROC::roc(roc.data$known.class, roc.data$lambda.min, quiet=TRUE)
+Test.error.enet[i, iter]<-pROC::auc(enet_proc)
+}
+}
+
+```
+
+```{r}
+#set column names for each alpha value tested
+name<-vector(length = length(a))
+for(i in 1:length(a)){
+  name[i]<-paste0("alpha_",a[i])
+}
+colnames(Test.error.enet)<-name
+#build dataframe
+AUC_alpha_value_evaluation<-
+  data.frame(cbind(trial=1:nrow(Test.error.enet),Test.error.enet))
+#export dataframe to working directory
+write.table(AUC_alpha_value_evaluation, 
+            file = "AUC_alpha_value_genus_evalutation.csv", 
+            sep = ",", quote = FALSE, row.names = F)
+#generate box plots of AUC for each alpha
+boxplot(Test.error.enet, names=a, 
+        xlab='alpha value', ylab='Area Under Curve')
+#identify which alpha value performed best
+col_index<-which(colMeans(Test.error.enet)==
+                   max(colMeans(Test.error.enet)))
+a[col_index]
+max(colMeans(Test.error.enet))
+```
+
+```{r,warning=FALSE, message=FALSE}
+#Cross-validator comparing all models
+set.seed(1)
+trials=50
+k=2
+BIC_model <- matrix(ncol=k, nrow=trials)
+AIC_model <- matrix(ncol=k, nrow=trials)
+LASSO_model <- matrix(ncol=k, nrow=trials)
+Ridge_model <- matrix(ncol=k, nrow=trials)
+Enet_model <- matrix(ncol=k, nrow=trials)
+Coef.Table<-NULL
+
+for(j in 1:trials){
+print(j)
+fold<-createFolds(genera_subset$CoV_Results, k =k)
+for(i in 1:length(fold)){
+Train <- genera_subset %>% slice(-fold[[i]])
+Test <- genera_subset %>% slice(fold[[i]])
+Model.Matrix.Test<-model.matrix(
+  lm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (genus+Age+Sex)^2, data=Test))
+Model.Matrix.Train<-model.matrix(
+  lm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (genus+Age+Sex)^2, data=Train))
+
+#BIC model
+m <- step(glm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (genus+Age+Sex)^2, data=Train, family = binomial), 
+                    k = log(dim(Train)[1]), trace=FALSE,direction="both")
+
+preds.m<-predict(m,Test,type='response')
+roc.data<-data.frame(Predictions=preds.m,
+                     known.class=Test$CoV_Results)
+model_proc<-pROC::roc(roc.data$known.class, 
+                      roc.data$Predictions, quiet=TRUE)
+BIC_model[j,i]<-pROC::auc(model_proc)
+
+#AIC model
+m <- step(glm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (genus+Age+Sex)^2, data=Train, family = binomial), 
+                    k = 2, trace=FALSE,direction="both")
+preds.m<-predict(m,Test,type='response')
+roc.data<-data.frame(Predictions=preds.m,
+                     known.class=Test$CoV_Results)
+model_proc<-pROC::roc(roc.data$known.class, 
+                      roc.data$Predictions, quiet=TRUE)
+AIC_model[j,i]<-pROC::auc(model_proc)
+
+#LASSO model
+lasso.fit <- 
+  cv.glmnet(Model.Matrix.Train,Train$CoV_Results,family="binomial",
+            type.measure = "auc",alpha=1)
+lasso.preds <- 
+  predict(lasso.fit, newx = Model.Matrix.Test, 
+          s = "lambda.min",type='response')
+roc.data<-data.frame(Predictions=lasso.preds,
+                     known.class=Test$CoV_Results)
+lasso_proc<-pROC::roc(roc.data$known.class, roc.data$lambda.min, quiet=TRUE)
+LASSO_model[j,i]<-pROC::auc(lasso_proc)
+
+#Ridge model
+ridge.fit <- 
+  cv.glmnet(Model.Matrix.Train,Train$CoV_Results,family="binomial",
+            type.measure = "auc",alpha=0)
+ridge.preds <- 
+  predict(ridge.fit, newx = Model.Matrix.Test, 
+          s = "lambda.min",type='response')
+roc.data<-data.frame(Predictions=ridge.preds,
+                     known.class=Test$CoV_Results)
+ridge_proc<-pROC::roc(roc.data$known.class, roc.data$lambda.min, quiet=TRUE)
+Ridge_model[j,i]<-pROC::auc(ridge_proc)
+
+#enet model
+enet.fit <- 
+  cv.glmnet(Model.Matrix.Train,Train$CoV_Results,family="binomial",
+            type.measure = "auc",alpha=0.72)
+enet.preds <- 
+  predict(enet.fit, newx = Model.Matrix.Test, 
+          s = "lambda.min",type='response')
+roc.data<-data.frame(Predictions=enet.preds,
+                     known.class=Test$CoV_Results)
+enet_proc<-pROC::roc(roc.data$known.class, roc.data$lambda.min, quiet=TRUE)
+Enet_model[j,i]<-pROC::auc(enet_proc)
+
+}
+}
+
+genus_cv.summary.df<-rbind(data.frame(
+  auc=as.vector(BIC_model), 
+                      Model=rep("BIC", 
+                                 length=length(as.vector(BIC_model)))),
+  data.frame(auc=as.vector(AIC_model),
+             Model=rep("AIC",
+                       length=length(as.vector(AIC_model)))),
+  data.frame(auc=as.vector(LASSO_model),
+             Model=rep("LASSO",
+                       length=length(as.vector(LASSO_model)))),
+  data.frame(auc=as.vector(Ridge_model),
+             Model=rep("Ridge",
+                       length=length(as.vector(Ridge_model)))),
+   data.frame(auc=as.vector(Enet_model),
+             Model=rep("ENet",
+                       length=length(as.vector(Enet_model)))))
+
+knitr::kable(genus_cv.summary.df %>% group_by(Model) %>% 
+               summarise(Mean.test.set.auc=mean(auc)%>% round(4), 
+                         Sd=sd(auc)%>% round(4)))
+genus_cv.summary.df %>%
+  ggplot(aes(x=auc)) +geom_boxplot(aes(fill=Model)) + 
+  theme_bw()+theme(axis.text.y = element_blank(),
+                   axis.ticks.y = element_blank()) + 
+  xlab("Area Under the Curve")
+
+pairwise.wilcox.test(genus_cv.summary.df$auc,genus_cv.summary.df$Model,
+                     paired = TRUE)
+```
+
+```{r}
+#Generating bootstrap coefficients
+sample_size=nrow(genera_subset)
+trials<-1000
+registerDoParallel(2)
+system.time(predictor_bootstrap_coefficients<-
+              foreach (j=1:trials,.combine = rbind) %dopar% {
+  set.seed(j)
+index <- sample(1:sample_size, sample_size, replace=TRUE)
+Boot.temp <- genera_subset %>% slice(index)
+Model.Matrix<-model.matrix(
+  lm(CoV_Results~Human.population.size.in.1.km.radius.of.site.+
+       lab+Shannon_H_index_cs+Fraction_juv_cs+Fraction_F_cs+
+       Trapping.at.a.cave.or.mine.+ 
+       Frequency.of.human.visitation.to.the.site +
+       Water.present.at.the.site.+ Site.accessibility +
+       (genus+Age+Sex)^2, data=Boot.temp))
+Ridge.cv <- cv.glmnet(Model.Matrix,Boot.temp$CoV_Results,
+                      family="binomial",
+            type.measure = "auc",alpha=0)
+as.numeric(coef(Ridge.cv, s="lambda.min"))
+})
+```
+
+```{r}
+#generate a list of coefficients used in the Ridge model.
+#This was done by pointing the "coef" function to the fitted ridge model
+#in the cross-validator loop.
+names_coef<-row.names(coef(ridge.fit, s="lambda.min"))
+#converting the output from the bootstrap object to a data frame and
+#renaming the column headers
+predictor_bootstrap_coefficients<-
+  data.frame(predictor_bootstrap_coefficients)
+colnames(predictor_bootstrap_coefficients)<-names_coef
+#add a column of numbers for each round of replication, and remove
+#the 2nd intercept coefficient that glmnet generates when fitting models
+predictor_bootstrap_coefficients<-
+  data.frame(cbind(bs_replicate=1:nrow(predictor_bootstrap_coefficients),
+                   predictor_bootstrap_coefficients)) %>% 
+  select(-X.Intercept..1)
+#write the table to a .csv in the working directory
+#to avoid re-running the loop
+write.table(predictor_bootstrap_coefficients, 
+            file = "ridge_genus_bootstrap_table_1000.csv", 
+            sep = ",", quote = FALSE, row.names = F)
+```
+
+```{r}
+predictor_bootstrap_coefficients <- predictor_bootstrap_coefficients %>% 
+  select(-bs_replicate)
+#Generate histogram of coefficients for each predictor
+predictor_bootstrap_coefficients %>% 
+  pivot_longer(cols = everything(), names_to="Predictor", 
+               values_to="Estimate") %>% 
+  ggplot()+facet_wrap(~Predictor,scales = "free_x") + 
+  geom_histogram(aes(x=Estimate),bins = 20)
+#generate mean estimate for each coefficient
+Mean.estimate<-predictor_bootstrap_coefficients %>% 
+  pivot_longer(everything(),names_to = "Predictor", 
+               values_to="estimate") %>% group_by(`Predictor`) %>% 
+  summarise(Mean=mean(`estimate`))
+#generate Bias Corrected and Adjusted 95% CI for each coefficient
+BCA_intervals<-
+  matrix(ncol = 2, nrow = ncol(predictor_bootstrap_coefficients))
+for (i in 1:ncol(predictor_bootstrap_coefficients)) {
+ BCA_intervals[i,]<-coxed::bca(predictor_bootstrap_coefficients[,i])
+}
+colnames(BCA_intervals)<-c("lwr","upr")
+BCA_interval_frame<-
+  data.frame(Predictor=
+               colnames(predictor_bootstrap_coefficients), 
+             BCA_intervals)
+#joining mean estimate and 95% CI for coefficients
+#If the confidence interval contains zero on the logit scale the predictor
+#is not considered to be significant
+logit_scale_coefficient_summary<-
+  left_join(Mean.estimate, BCA_interval_frame, 
+                     by="Predictor") %>%
+  mutate("contains.zero?"=
+           ifelse(
+             `lwr`<=0 & `upr`>=0,
+             "Y","N"))
+#These next few lines of code require manual curation of the coefficient
+#summary output to generate a plot of significant coefficients
+#generate a subset of significant predictors
+keep<-logit_scale_coefficient_summary %>% filter(`contains.zero?`=="N")
+#create a separate list of predictors that have one factor level identified
+#as significant. For example if Bat family Rhinolophidae was identified as
+#significant than "Bat.family" is a significant predictor of prevalence.
+#However, filtering the coefficient summary using the filter command on line
+#1340 removes all "Bat.family" coefficients. Since we're saying bat family
+#identity matters we need to capture all "Bat.family" coefficients significant
+#or not.
+keep2<-logit_scale_coefficient_summary %>% 
+  filter(str_detect(Predictor, 
+                    "Frequency.of.human.visitation.to.the.site") | 
+           str_detect(Predictor, "genus")|
+           str_detect(Predictor, 
+                      "Human.population.size.in.1.km.radius.of.site.")|
+           str_detect(Predictor, "Age")|
+           str_detect(Predictor, "Sex") == TRUE) %>%
+  subset(!Predictor %in% c("AgeJuvenile_.J..SexMale_.M."))
+#Merge 2 objects containing significant predictors
+retained_predictors<-rbind(keep,keep2) %>% distinct()
+#Converted coefficients to probability values. Needed "faraway" package
+#to have this "ilogit" function used to convert coefficients. If the
+#confidence interval contains 0.5 the predictor is not significant
+retained_predictors %>% mutate(Predictor = fct_reorder(Predictor, Mean),
+                               Mean=faraway::ilogit(Mean),
+                               lwr=faraway::ilogit(lwr),
+                               upr=faraway::ilogit(upr)) %>% 
+  rename("Contains 0.5?"="contains.zero?") %>%
+#pass this into ggplot for figure
+ggplot()+
+  geom_pointrange(aes(x=Predictor, 
+                      y=Mean,ymin=lwr,ymax=upr,color=`Contains 0.5?`)) + 
+  geom_hline(yintercept = 0.5,linetype="dashed", color = "red") +
+  coord_flip() + ylab("Probability of Infection") + xlab("") + 
+  ggtitle("Genus Ridge Model")
+
+```
