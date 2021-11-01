@@ -19,6 +19,8 @@ library(lubridate)
 library(vegan)
 library(foreach)
 library(doParallel)
+library(coxed)
+library(faraway)
 ```
 
 ```{r}
