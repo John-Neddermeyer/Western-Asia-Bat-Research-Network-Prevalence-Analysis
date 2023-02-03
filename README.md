@@ -6,6 +6,8 @@ using PCR with degenerate primers designed to target coroanvirus RNA-dependent R
 was not included in this analyses. Only presence or absence of coronavirus infection. Data were modeled using logistic regression
 with a logit link function.
 
+Note: This analysis is not yet complete and any results are subject to change.
+
 ## Modeling Approach
 
 Exploratory figures were generated to visualize relationships between predictor variables and response variable
